@@ -95,6 +95,7 @@ void setupGenerator(Generator *g, int mc, uint32_t flags)
     {
         g->bnb.mc = mc;
     }
+    g->nn.mc = mc;
 }
 
 void applySeed(Generator *g, int dim, uint64_t seed)

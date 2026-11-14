@@ -5,6 +5,9 @@
 #include "tables/btree19.h"
 #include "tables/btree20.h"
 #include "tables/btree21wd.h"
+#include "tables/btree2111.h"
+#include "tables/btree262.h"
+#include "tables/btree263.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -164,6 +167,15 @@ double sampleSurfaceNoise(const SurfaceNoise *sn, int x, int y, int z)
 void setNetherSeed(NetherNoise *nn, uint64_t seed)
 {
     uint64_t s;
+    if (nn->mc >= MC_26_3)
+    {   // base amplitude of nether/temperature and nether/vegetation
+        const double amp = 0.9494731054427981;
+        setSeed(&s, seed);
+        doublePerlinInitNether263(&nn->temperature, &s, &nn->oct[0], &nn->oct[2], -7, 2, amp);
+        setSeed(&s, seed+1);
+        doublePerlinInitNether263(&nn->humidity, &s, &nn->oct[4], &nn->oct[6], -7, 2, amp);
+        return;
+    }
     setSeed(&s, seed);
     doublePerlinInit(&nn->temperature, &s, &nn->oct[0], &nn->oct[2], -7, 2);
     setSeed(&s, seed+1);
@@ -174,26 +186,72 @@ void setNetherSeed(NetherNoise *nn, uint64_t seed)
  */
 int getNetherBiome(const NetherNoise *nn, int x, int y, int z, float *ndel)
 {
-    const float npoints[5][4] = {
-        { 0,    0,      0,              nether_wastes       },
-        { 0,   -0.5,    0,              soul_sand_valley    },
-        { 0.4,  0,      0,              crimson_forest      },
-        { 0,    0.5,    0.375*0.375,    warped_forest       },
-        {-0.5,  0,      0.175*0.175,    basalt_deltas       },
+    // Quantized noise points (x10000) in the order that they appear in the
+    // game's R-tree (1.18+), which determines the winner when distances tie.
+    static const int64_t npoints[5][4] = {
+        {     0,     0,     0,  nether_wastes       },
+        {  4000,     0,     0,  crimson_forest      },
+        {     0, -5000,     0,  soul_sand_valley    },
+        { -5000,     0,  1750,  basalt_deltas       },
+        {     0,  5000,  3750,  warped_forest       },
     };
 
     y = 0;
-    float temp = sampleDoublePerlin(&nn->temperature, x, y, z);
-    float humidity = sampleDoublePerlin(&nn->humidity, x, y, z);
+    float temp, humidity;
+    if (nn->mc >= MC_26_3)
+    {
+        temp = sampleDoublePerlinNether263(&nn->temperature, x, y, z);
+        humidity = sampleDoublePerlinNether263(&nn->humidity, x, y, z);
+    }
+    else
+    {
+        temp = sampleDoublePerlin(&nn->temperature, x, y, z);
+        humidity = sampleDoublePerlin(&nn->humidity, x, y, z);
+    }
+
+    if (nn->mc <= MC_1_17)
+    {   // 1.16 - 1.17 compare the unquantized fitness in list order
+        const float fpoints[5][4] = {
+            { 0,    0,      0,              nether_wastes       },
+            { 0,   -0.5,    0,              soul_sand_valley    },
+            { 0.4,  0,      0,              crimson_forest      },
+            { 0,    0.5,    0.375*0.375,    warped_forest       },
+            {-0.5,  0,      0.175*0.175,    basalt_deltas       },
+        };
+        int i, id = 0;
+        float dmin = FLT_MAX;
+        float dmin2 = FLT_MAX;
+        for (i = 0; i < 5; i++)
+        {
+            float dx = fpoints[i][0] - temp;
+            float dy = fpoints[i][1] - humidity;
+            float dsq = dx*dx + dy*dy + fpoints[i][2];
+            if (dsq < dmin)
+            {
+                dmin2 = dmin;
+                dmin = dsq;
+                id = i;
+            }
+            else if (dsq < dmin2)
+                dmin2 = dsq;
+        }
+        if (ndel)
+            *ndel = sqrtf(dmin2) - sqrtf(dmin);
+        return (int) fpoints[id][3];
+    }
+
+    // 1.18+: Climate.target() quantizes the noise and the parameters
+    int64_t qt = (int64_t)(10000.0F * temp);
+    int64_t qh = (int64_t)(10000.0F * humidity);
 
     int i, id = 0;
-    float dmin = FLT_MAX;
-    float dmin2 = FLT_MAX;
+    int64_t dmin = INT64_MAX;
+    int64_t dmin2 = INT64_MAX;
     for (i = 0; i < 5; i++)
     {
-        float dx = npoints[i][0] - temp;
-        float dy = npoints[i][1] - humidity;
-        float dsq = dx*dx + dy*dy + npoints[i][2];
+        int64_t dx = npoints[i][0] - qt;
+        int64_t dy = npoints[i][1] - qh;
+        int64_t dsq = dx*dx + dy*dy + npoints[i][2]*npoints[i][2];
         if (dsq < dmin)
         {
             dmin2 = dmin;
@@ -205,7 +263,10 @@ int getNetherBiome(const NetherNoise *nn, int x, int y, int z, float *ndel)
     }
 
     if (ndel)
-        *ndel = sqrtf(dmin2) - sqrtf(dmin);
+    {   // margin in noise units; leave room for the quantization of t and h
+        float del = sqrtf((float)dmin2) - sqrtf((float)dmin) - 2.0F;
+        *ndel = del > 0 ? del / 10000.0F : 0;
+    }
 
     id = (int) npoints[id][3];
     return id;
@@ -841,9 +902,29 @@ int genEndScaled(const EndNoise *en, int *out, Range r, int mc, uint64_t sha)
 // Overworld and Nether Biome Generation 1.18
 //==============================================================================
 
+// Base amplitudes of the 26.3 climate noises (see worldgen/noise/*.json),
+// which reproduce the legacy normalization.
+static const double g_base_amp_263[NP_MAX] = {
+    1.2453007926713473, // NP_TEMPERATURE
+    0.9494731054427978, // NP_HUMIDITY
+    0.8880832896205223, // NP_CONTINENTALNESS
+    1.063180125160734,  // NP_EROSION
+    0.9381732587751005, // NP_SHIFT
+    0.9147152149950137, // NP_WEIRDNESS
+};
+
+static int init_climate_noise(int mc, DoublePerlinNoise *dpn, Xoroshiro *xr,
+    PerlinNoise *oct, const double *amp, int omin, int len, int nptype, int nmax)
+{
+    if (mc >= MC_26_3)
+        return xDoublePerlinInit263(dpn, xr, oct, amp, omin, len,
+            g_base_amp_263[nptype], nmax);
+    return xDoublePerlinInit(dpn, xr, oct, amp, omin, len, nmax);
+}
+
 static int init_climate_seed(
     DoublePerlinNoise *dpn, PerlinNoise *oct,
-    uint64_t xlo, uint64_t xhi, int large, int nptype, int nmax
+    uint64_t xlo, uint64_t xhi, int large, int nptype, int nmax, int mc
     )
 {
     Xoroshiro pxr;
@@ -856,7 +937,7 @@ static int init_climate_seed(
         // md5 "minecraft:offset"
         pxr.lo = xlo ^ 0x080518cf6af25384;
         pxr.hi = xhi ^ 0x3f3dfb40a54febd5;
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, -3, 4, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, -3, 4, nptype, nmax);
         } break;
 
     case NP_TEMPERATURE: {
@@ -864,7 +945,7 @@ static int init_climate_seed(
         // md5 "minecraft:temperature" or "minecraft:temperature_large"
         pxr.lo = xlo ^ (large ? 0x944b0073edf549db : 0x5c7e6b29735f0d7f);
         pxr.hi = xhi ^ (large ? 0x4ff44347e9d22b96 : 0xf7d86f1bbc734988);
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, large ? -12 : -10, 6, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, large ? -12 : -10, 6, nptype, nmax);
         } break;
 
     case NP_HUMIDITY: {
@@ -872,7 +953,7 @@ static int init_climate_seed(
         // md5 "minecraft:vegetation" or "minecraft:vegetation_large"
         pxr.lo = xlo ^ (large ? 0x71b8ab943dbd5301 : 0x81bb4d22e8dc168e);
         pxr.hi = xhi ^ (large ? 0xbb63ddcf39ff7a2b : 0xf1c8b4bea16303cd);
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, large ? -10 : -8, 6, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, large ? -10 : -8, 6, nptype, nmax);
         } break;
 
     case NP_CONTINENTALNESS: {
@@ -880,7 +961,7 @@ static int init_climate_seed(
         // md5 "minecraft:continentalness" or "minecraft:continentalness_large"
         pxr.lo = xlo ^ (large ? 0x9a3f51a113fce8dc : 0x83886c9d0ae3a662);
         pxr.hi = xhi ^ (large ? 0xee2dbd157e5dcdad : 0xafa638a61b42e8ad);
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, large ? -11 : -9, 9, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, large ? -11 : -9, 9, nptype, nmax);
         } break;
 
     case NP_EROSION: {
@@ -888,7 +969,7 @@ static int init_climate_seed(
         // md5 "minecraft:erosion" or "minecraft:erosion_large"
         pxr.lo = xlo ^ (large ? 0x8c984b1f8702a951 : 0xd02491e6058f6fd8);
         pxr.hi = xhi ^ (large ? 0xead7b1f92bae535f : 0x4792512c94c17a80);
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, large ? -11 : -9, 5, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, large ? -11 : -9, 5, nptype, nmax);
         } break;
 
     case NP_WEIRDNESS: {
@@ -896,7 +977,7 @@ static int init_climate_seed(
         // md5 "minecraft:ridge"
         pxr.lo = xlo ^ 0xefc8ef4d36102b34;
         pxr.hi = xhi ^ 0x1beeeb324a0f24ea;
-        n += xDoublePerlinInit(dpn, &pxr, oct, amp, -7, 6, nmax);
+        n += init_climate_noise(mc, dpn, &pxr, oct, amp, -7, 6, nptype, nmax);
         } break;
 
     default:
@@ -915,7 +996,7 @@ void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large)
 
     int n = 0, i = 0;
     for (; i < NP_MAX; i++)
-        n += init_climate_seed(&bn->climate[i], bn->oct+n, xlo, xhi, large, i, -1);
+        n += init_climate_seed(&bn->climate[i], bn->oct+n, xlo, xhi, large, i, -1, bn->mc);
 
     if ((size_t)n > sizeof(bn->oct) / sizeof(*bn->oct))
     {
@@ -942,6 +1023,12 @@ void setBetaBiomeSeed(BiomeNoiseBeta *bnb, uint64_t seed)
 
 
 enum { SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS };
+
+// single precision lerp, as Mth.lerp(float, float, float)
+static inline float lerpf(float part, float from, float to)
+{
+    return from + part * (to - from);
+}
 
 static void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
 {
@@ -1006,8 +1093,8 @@ static Spline *createSpline_38219(SplineStack *ss, float f, int bl)
     {
         u = (k - i) * 0.5F;
         if (bl) {
-            addSplineVal(sp, -1.0F, createFixSpline(ss, i > 0.2 ? i : 0.2), 0);
-            addSplineVal(sp,  0.0F, createFixSpline(ss, lerp(0.5F, i, k)), u);
+            addSplineVal(sp, -1.0F, createFixSpline(ss, i > 0.2F ? i : 0.2F), 0);
+            addSplineVal(sp,  0.0F, createFixSpline(ss, lerpf(0.5F, i, k)), u);
         } else {
             addSplineVal(sp, -1.0F, createFixSpline(ss, i), u);
         }
@@ -1037,8 +1124,8 @@ static Spline *createFlatOffsetSpline(
 static Spline *createLandSpline(
     SplineStack *ss, float f, float g, float h, float i, float j, float k, int bl)
 {
-    Spline *sp1 = createSpline_38219(ss, lerp(i, 0.6F, 1.5F), bl);
-    Spline *sp2 = createSpline_38219(ss, lerp(i, 0.6F, 1.0F), bl);
+    Spline *sp1 = createSpline_38219(ss, lerpf(i, 0.6F, 1.5F), bl);
+    Spline *sp2 = createSpline_38219(ss, lerpf(i, 0.6F, 1.0F), bl);
     Spline *sp3 = createSpline_38219(ss, i, bl);
     const float ih = 0.5F * i;
     Spline *sp4 = createFlatOffsetSpline(ss, f-0.15F, ih, ih, ih, i*0.6F, 0.5F);
@@ -1082,30 +1169,35 @@ float getSpline(const Spline *sp, const float *vals)
     if (sp->len == 1)
         return ((FixSpline*)sp)->val;
 
+    // Matches CubicSpline.Multipoint: evaluated entirely in single precision,
+    // with the interval starting at the last location that is <= f.
     float f = vals[sp->typ];
     int i;
 
     for (i = 0; i < sp->len; i++)
-        if (sp->loc[i] >= f)
+        if (f < sp->loc[i])
             break;
-    if (i == 0 || i == sp->len)
+    i--;
+    if (i < 0 || i == sp->len - 1)
     {
-        if (i) i--;
+        if (i < 0) i = 0;
         float v = getSpline(sp->val[i], vals);
+        if (sp->der[i] == 0)
+            return v;
         return v + sp->der[i] * (f - sp->loc[i]);
     }
-    const Spline *sp1 = sp->val[i-1];
-    const Spline *sp2 = sp->val[i];
-    float g = sp->loc[i-1];
-    float h = sp->loc[i];
+    const Spline *sp1 = sp->val[i];
+    const Spline *sp2 = sp->val[i+1];
+    float g = sp->loc[i];
+    float h = sp->loc[i+1];
     float k = (f - g) / (h - g);
-    float l = sp->der[i-1];
-    float m = sp->der[i];
+    float l = sp->der[i];
+    float m = sp->der[i+1];
     float n = getSpline(sp1, vals);
     float o = getSpline(sp2, vals);
     float p = l * (h - g) - (o - n);
     float q = -m * (h - g) + (o - n);
-    float r = lerp(k, n, o) + k * (1.0F - k) * lerp(k, p, q);
+    float r = lerpf(k, n, o) + k * (1.0F - k) * lerpf(k, p, q);
     return r;
 }
 
@@ -1138,6 +1230,76 @@ void initBiomeNoise(BiomeNoise *bn, int mc)
 
 
 /// Biome sampler for MC 1.18
+/* Depth as evaluated by the 1.19 - 26.2 density functions:
+ *   y_clamped_gradient(-64, 320, 1.5, -1.5) + (-0.50375F + spline)
+ * in double precision, with the spline inputs cast to float. The ridges are
+ * folded in double precision before the cast. (1.18 used the terrain shaper,
+ * which folded the ridges and applied the offset in single precision.)
+ */
+static double getDepth18(const BiomeNoise *bn, double c, double e, double w, int y)
+{
+    if (bn->mc <= MC_1_18)
+    {
+        float cf = c, ef = e, wf = w;
+        float np_param[] = {
+            cf, ef, -3.0F * ( fabsf( fabsf(wf) - 0.6666667F ) - 0.33333334F ), wf,
+        };
+        double off = getSpline(bn->sp, np_param) + 0.015F;
+        return 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
+    }
+    float np_param[] = {
+        (float) c, (float) e,
+        (float) (-3.0 * (-0.3333333333333333 + fabs(-0.6666666666666666 + fabs(w)))),
+        (float) w,
+    };
+    double off = -0.50375F + (double) getSpline(bn->sp, np_param);
+    double f = ((y * 4) - -64) / (double) (320 - -64);
+    double grad = f < 0 ? 1.5 : f > 1 ? -1.5 : 1.5 + f * (-1.5 - 1.5);
+    return grad + off;
+}
+
+/* Depth as evaluated by the 26.3 density functions, in single precision:
+ *   gradient(y: -64 -> 320, 1.5 -> -1.5) + (spline + -0.50375)
+ */
+static float getDepth263(const BiomeNoise *bn, float c, float e, float w, int y)
+{
+    float np_param[] = {
+        c, e, (fabsf(fabsf(w) + -0.6666667F) + -0.33333334F) * -3.0F, w,
+    };
+    float off = getSpline(bn->sp, np_param) + -0.50375F;
+    int by = y * 4;
+    if (by < -64) by = -64;
+    if (by > 320) by = 320;
+    float factor = (-1.5F - 1.5F) / (float) (320 - -64);
+    float grad = 1.5F + (float) (by - -64) * factor;
+    return grad + off;
+}
+
+/* Climate sampling of 26.3: the shift_a/shift_b offsets and the climate noises
+ * are evaluated in single precision.
+ */
+static void sampleClimate263(const BiomeNoise *bn, float *v, int x, int y, int z,
+    uint32_t sample_flags)
+{
+    double px = x, pz = z;
+    if (!(sample_flags & SAMPLE_NO_SHIFT))
+    {
+        float sx = sampleDoublePerlin263(&bn->climate[NP_SHIFT], x, 0, z) * 4.0F;
+        float sz = sampleDoublePerlin263(&bn->climate[NP_SHIFT], z, x, 0) * 4.0F;
+        px += (double) sx;
+        pz += (double) sz;
+    }
+    float c = sampleDoublePerlin263(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+    float e = sampleDoublePerlin263(&bn->climate[NP_EROSION], px, 0, pz);
+    float w = sampleDoublePerlin263(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+    v[0] = sampleDoublePerlin263(&bn->climate[NP_TEMPERATURE], px, 0, pz);
+    v[1] = sampleDoublePerlin263(&bn->climate[NP_HUMIDITY], px, 0, pz);
+    v[2] = c;
+    v[3] = e;
+    v[4] = (sample_flags & SAMPLE_NO_DEPTH) ? 0 : getDepth263(bn, c, e, w, y);
+    v[5] = w;
+}
+
 int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     uint64_t *dat, uint32_t sample_flags)
 {
@@ -1150,30 +1312,34 @@ int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     }
 
     float t = 0, h = 0, c = 0, e = 0, d = 0, w = 0;
-    double px = x, pz = z;
-    if (!(sample_flags & SAMPLE_NO_SHIFT))
+    if (bn->mc >= MC_26_3)
     {
-        px += sampleDoublePerlin(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
-        pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+        float v[6];
+        sampleClimate263(bn, v, x, y, z, sample_flags);
+        t = v[0]; h = v[1]; c = v[2]; e = v[3]; d = v[4]; w = v[5];
     }
-
-    c = sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
-    e = sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
-    w = sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
-
-    if (!(sample_flags & SAMPLE_NO_DEPTH))
+    else
     {
-        float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
-        };
-        double off = getSpline(bn->sp, np_param) + 0.015F;
+        double px = x, pz = z;
+        if (!(sample_flags & SAMPLE_NO_SHIFT))
+        {
+            px += sampleDoublePerlin(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
+            pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+        }
 
-        //double py = y + sampleDoublePerlin(&bn->shift, y, z, x) * 4.0;
-        d = 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
+        double cd = sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+        double ed = sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
+        double wd = sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+        c = cd;
+        e = ed;
+        w = wd;
+
+        if (!(sample_flags & SAMPLE_NO_DEPTH))
+            d = getDepth18(bn, cd, ed, wd, y);
+
+        t = sampleDoublePerlin(&bn->climate[NP_TEMPERATURE], px, 0, pz);
+        h = sampleDoublePerlin(&bn->climate[NP_HUMIDITY], px, 0, pz);
     }
-
-    t = sampleDoublePerlin(&bn->climate[NP_TEMPERATURE], px, 0, pz);
-    h = sampleDoublePerlin(&bn->climate[NP_HUMIDITY], px, 0, pz);
 
     int64_t l_np[6];
     int64_t *p_np = np ? np : l_np;
@@ -1453,11 +1619,29 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
         btree21wd_steps, &btree21wd_param[0][0], btree21wd_nodes, btree21wd_order,
         sizeof(btree21wd_nodes) / sizeof(uint64_t)
     };
+    static const BiomeTree btree2111 = {
+        btree2111_steps, &btree2111_param[0][0], btree2111_nodes, btree2111_order,
+        sizeof(btree2111_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree262 = {
+        btree262_steps, &btree262_param[0][0], btree262_nodes, btree262_order,
+        sizeof(btree262_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree263 = {
+        btree263_steps, &btree263_param[0][0], btree263_nodes, btree263_order,
+        sizeof(btree263_nodes) / sizeof(uint64_t)
+    };
 
     const BiomeTree *bt;
     int idx;
 
-    if (mc >= MC_1_21_WD)
+    if (mc >= MC_26_3)
+        bt = &btree263;
+    else if (mc >= MC_26_2)
+        bt = &btree262;
+    else if (mc >= MC_1_21_8)
+        bt = &btree2111;
+    else if (mc >= MC_1_21_WD)
         bt = &btree21wd;
     else if (mc >= MC_1_20_6)
         bt = &btree20;
@@ -1494,34 +1678,52 @@ void setClimateParaSeed(BiomeNoise *bn, uint64_t seed, int large, int nptype, in
     {
         int n = 0;
         n += init_climate_seed(bn->climate + NP_CONTINENTALNESS,
-            bn->oct + n, xlo, xhi, large,    NP_CONTINENTALNESS, nmax);
+            bn->oct + n, xlo, xhi, large,    NP_CONTINENTALNESS, nmax, bn->mc);
         n += init_climate_seed(bn->climate + NP_EROSION,
-            bn->oct + n, xlo, xhi, large,    NP_EROSION, nmax);
+            bn->oct + n, xlo, xhi, large,    NP_EROSION, nmax, bn->mc);
         n += init_climate_seed(bn->climate + NP_WEIRDNESS,
-            bn->oct + n, xlo, xhi, large,    NP_WEIRDNESS, nmax);
+            bn->oct + n, xlo, xhi, large,    NP_WEIRDNESS, nmax, bn->mc);
     }
     else
     {
-        init_climate_seed(bn->climate + nptype, bn->oct, xlo, xhi, large, nptype, nmax);
+        init_climate_seed(bn->climate + nptype, bn->oct, xlo, xhi, large, nptype, nmax, bn->mc);
     }
     bn->nptype = nptype;
 }
 
 double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z)
 {
+    if (bn->mc >= MC_26_3)
+    {
+        float p;
+        if (bn->nptype == NP_DEPTH)
+        {
+            float c = sampleDoublePerlin263(bn->climate + NP_CONTINENTALNESS, x, 0, z);
+            float e = sampleDoublePerlin263(bn->climate + NP_EROSION, x, 0, z);
+            float w = sampleDoublePerlin263(bn->climate + NP_WEIRDNESS, x, 0, z);
+            p = getDepth263(bn, c, e, w, 0);
+            if (np)
+            {
+                np[2] = (int64_t)(10000.0F*c);
+                np[3] = (int64_t)(10000.0F*e);
+                np[5] = (int64_t)(10000.0F*w);
+            }
+        }
+        else
+        {
+            p = sampleDoublePerlin263(bn->climate + bn->nptype, x, 0, z);
+        }
+        if (np)
+            np[bn->nptype] = (int64_t)(10000.0F*p);
+        return p;
+    }
     if (bn->nptype == NP_DEPTH)
     {
-        float c, e, w;
-        c = sampleDoublePerlin(bn->climate + NP_CONTINENTALNESS, x, 0, z);
-        e = sampleDoublePerlin(bn->climate + NP_EROSION, x, 0, z);
-        w = sampleDoublePerlin(bn->climate + NP_WEIRDNESS, x, 0, z);
-
-        float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
-        };
-        double off = getSpline(bn->sp, np_param) + 0.015F;
-        int y = 0;
-        float d = 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
+        double cd = sampleDoublePerlin(bn->climate + NP_CONTINENTALNESS, x, 0, z);
+        double ed = sampleDoublePerlin(bn->climate + NP_EROSION, x, 0, z);
+        double wd = sampleDoublePerlin(bn->climate + NP_WEIRDNESS, x, 0, z);
+        float c = cd, e = ed, w = wd;
+        float d = getDepth18(bn, cd, ed, wd, 0);
         if (np)
         {
             np[2] = (int64_t)(10000.0F*c);

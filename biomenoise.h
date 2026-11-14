@@ -53,6 +53,7 @@ STRUCT(NetherNoise)
     DoublePerlinNoise temperature;
     DoublePerlinNoise humidity;
     PerlinNoise oct[8]; // buffer for octaves in double perlin noise
+    int mc;
 };
 
 // End biome generator 1.9+

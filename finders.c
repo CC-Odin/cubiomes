@@ -85,6 +85,7 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     s_ancient_city          = { 20083232, 24, 16, Ancient_City,     0,0},
     s_trail_ruins           = { 83469867, 34, 26, Trail_Ruins,      0,0},
     s_trial_chambers        = { 94251327, 34, 22, Trial_Chambers,   0,0},
+    s_abandoned_camp        = { 91231127, 37, 29, Abandoned_Camp,   0,0},
     s_treasure              = { 10387320,  1,  1, Treasure,         0,0},
     s_mineshaft             = {        0,  1,  1, Mineshaft,        0,0},
     s_desert_well_115       = {    30010,  1,  1, Desert_Well,      0, 1.f/1000},
@@ -193,6 +194,9 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     case Trial_Chambers:
         *sconf = s_trial_chambers;
         return mc >= MC_1_21_1;
+    case Abandoned_Camp:
+        *sconf = s_abandoned_camp;
+        return mc >= MC_26_3;
     default:
         memset(sconf, 0, sizeof(StructureConfig));
         return 0;
@@ -236,6 +240,7 @@ int getStructurePos(int structureType, int mc, uint64_t seed, int regX, int regZ
     case Ancient_City:
     case Trail_Ruins:
     case Trial_Chambers:
+    case Abandoned_Camp:
         *pos = getFeaturePos(sconf, seed, regX, regZ);
         return 1;
 
@@ -825,7 +830,10 @@ int isStrongholdBiome(int mc, int id)
         return mc <= MC_1_15 || mc >= MC_1_18;
     case mangrove_swamp:
     case deep_dark:
+    case dappled_forest:
         return 0;
+    case cherry_grove:
+        return mc >= MC_1_21_11;
     default:
         return 1;
     }
@@ -1233,6 +1241,33 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
         if (mc <= MC_1_20) return 0;
         return biomeID != deep_dark && isOverworld(mc, biomeID);
 
+    case Abandoned_Camp:
+        // union of the biomes of the 18 camp variants
+        if (mc <= MC_26_2) return 0;
+        switch (biomeID) {
+        case bamboo_jungle:
+        case birch_forest:
+        case cherry_grove:
+        case dappled_forest:
+        case flower_forest:
+        case forest:
+        case meadow:
+        case old_growth_birch_forest:
+        case old_growth_pine_taiga:
+        case old_growth_spruce_taiga:
+        case pale_garden:
+        case savanna:
+        case snowy_taiga:
+        case sparse_jungle:
+        case swamp:
+        case taiga:
+        case windswept_forest:
+        case wooded_badlands:
+            return 1;
+        default:
+            return 0;
+        }
+
     case Treasure:
         if (mc <= MC_1_12) return 0;
         return biomeID == beach || biomeID == snowy_beach;
@@ -1282,6 +1317,7 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
 
     case Mansion:
         if (mc <= MC_1_10) return 0;
+        if (mc >= MC_1_21_8 && biomeID == pale_garden) return 1;
         return biomeID == dark_forest || biomeID == dark_forest_hills;
 
     case Fortress:
@@ -1526,6 +1562,9 @@ int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t
     {
     case Trail_Ruins:
         if (g->mc <= MC_1_19) goto L_not_viable;
+        goto L_feature;
+    case Abandoned_Camp:
+        if (g->mc <= MC_26_2) goto L_not_viable;
         goto L_feature;
     case Ocean_Ruin:
     case Shipwreck:
@@ -4488,6 +4527,11 @@ int getBiomeCenters(Pos *pos, int *siz, int nmax, Generator *g, Range r,
     if (g->mc >= MC_1_18)
     {
         const int *lim = getBiomeParaLimits(g->mc, match);
+        static const int nolim[13] = { -1,
+            INT_MIN, INT_MAX, INT_MIN, INT_MAX, INT_MIN, INT_MAX,
+            INT_MIN, INT_MAX, INT_MIN, INT_MAX, INT_MIN, INT_MAX };
+        if (!lim)
+            lim = nolim + 1;
 
         int para[] = {
             NP_TEMPERATURE,
@@ -5470,6 +5514,20 @@ static const int g_biome_para_range_21wd_diff[][13] = {
 {pale_garden             , -1500, 2000,  3000, IMAX,   300, IMAX, -7799,  500,  IMIN, IMAX,  2666, IMAX},
 {-1,0,0,0,0,0,0,0,0,0,0,0,0}};
 
+static const int g_biome_para_range_2108_diff[][13] = {
+{pale_garden             , -1500, 2000,  3000, IMAX,   300, IMAX, -7799,  500,  IMIN, IMAX,  IMIN, IMAX},
+{-1,0,0,0,0,0,0,0,0,0,0,0,0}};
+
+// The region of sulfur caves extends well beyond its noise parameter box. The
+// limits are the sampled extent of the region with a margin of 1000.
+static const int g_biome_para_range_262_diff[][13] = {
+{sulfur_caves            ,  IMIN, IMAX,  IMIN, IMAX, -8703, 9499, -2312, IMAX, -2248, IMAX,  IMIN,-2505},
+{-1,0,0,0,0,0,0,0,0,0,0,0,0}};
+
+static const int g_biome_para_range_263_diff[][13] = {
+{dappled_forest          , -4500,-1500,  IMIN,-3500, -1900, IMAX,  IMIN, IMAX,  IMIN, IMAX,  -500, IMAX},
+{-1,0,0,0,0,0,0,0,0,0,0,0,0}};
+
 
 /**
  * Gets the min/max parameter values within which a biome change can occur.
@@ -5495,7 +5553,15 @@ const int *getBiomeParaExtremes(int mc)
         1000, 10500, // depth has more dependencies
         -9333, 9333,
     };
-    return extremes;
+    static const int extremes_262[] = { // sulfur caves
+        -4501, 5500,
+        -3500, 6999,
+        -10500, 9499,
+        -7799, 5500,
+        -2248, 10500,
+        -9333, 9333,
+    };
+    return mc >= MC_26_2 ? extremes_262 : extremes;
 }
 
 /**
@@ -5508,6 +5574,30 @@ const int *getBiomeParaLimits(int mc, int id)
     if (mc <= MC_1_17)
         return NULL;
     int i;
+    if (mc >= MC_26_3)
+    {
+        for (i = 0; g_biome_para_range_263_diff[i][0] != -1; i++)
+        {
+            if (g_biome_para_range_263_diff[i][0] == id)
+                return &g_biome_para_range_263_diff[i][1];
+        }
+    }
+    if (mc >= MC_26_2)
+    {
+        for (i = 0; g_biome_para_range_262_diff[i][0] != -1; i++)
+        {
+            if (g_biome_para_range_262_diff[i][0] == id)
+                return &g_biome_para_range_262_diff[i][1];
+        }
+    }
+    if (mc >= MC_1_21_8)
+    {
+        for (i = 0; g_biome_para_range_2108_diff[i][0] != -1; i++)
+        {
+            if (g_biome_para_range_2108_diff[i][0] == id)
+                return &g_biome_para_range_2108_diff[i][1];
+        }
+    }
     if (mc > MC_1_21_3)
     {
         for (i = 0; g_biome_para_range_21wd_diff[i][0] != -1; i++)

@@ -34,9 +34,15 @@ enum MCVersion
     MC_1_20_6, MC_1_20 = MC_1_20_6,
     MC_1_21_1,
     MC_1_21_3,
-    MC_1_21_WD, // Winter Drop, version TBA
-    MC_1_21 = MC_1_21_WD,
-    MC_NEWEST = MC_1_21,
+    MC_1_21_WD, MC_1_21_4 = MC_1_21_WD, // Winter Drop
+    MC_1_21_8,  // 1.21.5 - 1.21.8 (pale gardens replace more dark forest)
+    MC_1_21_11, // 1.21.9 - 1.21.11 (strongholds are biased to cherry groves)
+    MC_1_21 = MC_1_21_11,
+    MC_26_1,    // 26.1 - 26.1.2
+    MC_26_2,    // sulfur caves
+    MC_26_3,    // dappled forest, abandoned camps, float noise
+    MC_26 = MC_26_3,
+    MC_NEWEST = MC_26,
 };
 
 enum Dimension
@@ -173,6 +179,10 @@ enum BiomeID
     cherry_grove                    = 185,
     // 1.21 Winter Drop
     pale_garden                     = 186,
+    // 26.2
+    sulfur_caves                    = 187,
+    // 26.3
+    dappled_forest                  = 188,
 };
 
 

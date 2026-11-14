@@ -519,6 +519,7 @@ void sampleOctaveBeta17Terrain(const OctaveNoise *noise, double *v,
 void doublePerlinInit(DoublePerlinNoise *noise, uint64_t *seed,
         PerlinNoise *octavesA, PerlinNoise *octavesB, int omin, int len)
 {   // require: len >= 1 && omin+len <= 0
+    noise->stack263 = DPN_DOUBLE;
     noise->amplitude = (10.0 / 6.0) * len / (len + 1);
     octaveInit(&noise->octA, seed, octavesA, omin, len);
     octaveInit(&noise->octB, seed, octavesB, omin, len);
@@ -556,12 +557,18 @@ int xDoublePerlinInit(DoublePerlinNoise *noise, Xoroshiro *xr,
         0, 5./6, 10./9, 15./12, 20./15, 25./18, 30./21, 35./24, 40./27, 45./30,
     };
     noise->amplitude = amp_ini[len];
+    noise->stack263 = DPN_DOUBLE;
     return n;
 }
 
 double sampleDoublePerlin(const DoublePerlinNoise *noise,
         double x, double y, double z)
 {
+    if (noise->stack263 == DPN_STACK_263)
+        return sampleDoublePerlin263(noise, x, y, z);
+    if (noise->stack263 == DPN_STACK_263_NETHER)
+        return sampleDoublePerlinNether263(noise, x, y, z);
+
     const double f = 337.0 / 331.0;
     double v = 0;
 
@@ -571,3 +578,249 @@ double sampleDoublePerlin(const DoublePerlinNoise *noise,
     return v * noise->amplitude;
 }
 
+
+//==============================================================================
+// Single precision noise (MC 26.3+)
+//==============================================================================
+
+// Java's DoubleStream.sum(), which uses compensated summation.
+static double javaStreamSum(const double *v, int n)
+{
+    double sum = 0, comp = 0, simple = 0;
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        double tmp = v[i] - comp;
+        double velvel = sum + tmp;
+        comp = (velvel - sum) - tmp;
+        sum = velvel;
+        simple += v[i];
+    }
+    double tmp = sum - comp;
+    if (isnan(tmp) && isinf(simple))
+        return simple;
+    return tmp;
+}
+
+/* NormalNoise.buildOctaves() and computeNormalizationFactor() with the
+ * default normalization. Writes the amplitude and frequency of each non-zero
+ * octave and returns the normalization factor.
+ */
+static double getNormalNoiseOctaves263(const double *amplitudes, int omin,
+        int len, double baseAmplitude, double *amp, double *freq)
+{
+    double frequency = pow(2.0, omin);
+    double a = baseAmplitude * (pow(0.5, -(len - 1)) / (pow(0.5, -len) - 1.0));
+    double absamp[32];
+    int i, n = 0;
+
+    for (i = 0; i < len; i++)
+    {
+        if (amplitudes[i] != 0.0)
+        {
+            amp[n] = a * amplitudes[i];
+            freq[n] = frequency;
+            absamp[n] = fabs(amp[n]);
+            n++;
+        }
+        frequency *= 2.0;
+        a *= 0.5;
+    }
+
+    double target = javaStreamSum(absamp, n);
+    double variance = 0;
+    for (i = 0; i < n; i++)
+    {
+        double dev = 0.2702247831245211 * absamp[i];
+        variance += dev * dev;
+    }
+    double deviation = sqrt(variance);
+    if (deviation == 0.0)
+        return 0.0;
+    return (target * 0.3333333333333333) / (deviation * sqrt(2.0));
+}
+
+int xDoublePerlinInit263(DoublePerlinNoise *noise, Xoroshiro *xr,
+        PerlinNoise *octaves, const double *amplitudes, int omin, int len,
+        double baseAmplitude, int nmax)
+{
+    double amp[32], freq[32];
+    int i, n;
+
+    n = xDoublePerlinInit(noise, xr, octaves, amplitudes, omin, len, nmax);
+    double norm = getNormalNoiseOctaves263(amplitudes, omin, len, baseAmplitude,
+        amp, freq);
+
+    for (i = 0; i < noise->octA.octcnt; i++)
+    {
+        noise->octA.octaves[i].amplitude = (float) (norm * amp[i]);
+        noise->octA.octaves[i].lacunarity = freq[i];
+    }
+    for (i = 0; i < noise->octB.octcnt; i++)
+    {
+        noise->octB.octaves[i].amplitude = (float) (norm * amp[i]);
+        noise->octB.octaves[i].lacunarity = freq[i] * 1.0181268882175227;
+    }
+    noise->amplitude = 1.0;
+    noise->stack263 = DPN_STACK_263;
+    return n;
+}
+
+/* NormalNoise.createForLegacyNetherBiome(): two legacy octave stacks scaled
+ * by the normalized base amplitude.
+ */
+void doublePerlinInitNether263(DoublePerlinNoise *noise, uint64_t *seed,
+        PerlinNoise *octavesA, PerlinNoise *octavesB, int omin, int len,
+        double baseAmplitude)
+{
+    double ones[32], amp[32], freq[32];
+    int i;
+
+    doublePerlinInit(noise, seed, octavesA, octavesB, omin, len);
+
+    for (i = 0; i < len; i++)
+        ones[i] = 1.0;
+    double norm = getNormalNoiseOctaves263(ones, omin, len, baseAmplitude,
+        amp, freq);
+    float outer = (float) (norm * baseAmplitude);
+
+    // octaveInit() orders the octaves from high to low frequency, whereas the
+    // layers are summed from low to high frequency
+    for (i = 0; i < len / 2; i++)
+    {
+        PerlinNoise tmp = octavesA[i];
+        octavesA[i] = octavesA[len-1-i];
+        octavesA[len-1-i] = tmp;
+        tmp = octavesB[i];
+        octavesB[i] = octavesB[len-1-i];
+        octavesB[len-1-i] = tmp;
+    }
+
+    double factor = pow(2.0, omin);
+    double valueFactor = pow(2.0, len - 1) / (pow(2.0, len) - 1.0);
+    for (i = 0; i < len; i++)
+    {
+        float layer = (float) (valueFactor * 1.0);
+        octavesA[i].amplitude = layer * outer;
+        octavesB[i].amplitude = layer * outer;
+        octavesA[i].lacunarity = factor * 1.0;
+        octavesB[i].lacunarity = factor * 1.0181268882175227;
+        factor *= 2.0;
+        valueFactor /= 2.0;
+    }
+    noise->amplitude = 1.0;
+    noise->stack263 = DPN_STACK_263_NETHER;
+}
+
+static const float g_grad263[16][3] = {
+    { 1, 1, 0}, {-1, 1, 0}, { 1,-1, 0}, {-1,-1, 0},
+    { 1, 0, 1}, {-1, 0, 1}, { 1, 0,-1}, {-1, 0,-1},
+    { 0, 1, 1}, { 0,-1, 1}, { 0, 1,-1}, { 0,-1,-1},
+    { 1, 1, 0}, { 0,-1, 1}, {-1, 1, 0}, { 0,-1,-1},
+};
+
+static inline float gradDot263(int hash, float x, float y, float z)
+{
+    const float *g = g_grad263[hash & 0xf];
+    return g[0] * x + g[1] * y + g[2] * z;
+}
+
+static inline float smoothstep263(float x)
+{
+    return x * x * x * (x * (x * 6.0F - 15.0F) + 10.0F);
+}
+
+static inline float lerp263(float t, float a, float b)
+{
+    return a + t * (b - a);
+}
+
+// GradientNoise.wrap()
+static inline double wrap263(double x)
+{
+    const double half = 16777215.999999998; // Math.nextDown(1.6777216E7)
+    if (x >= -half && x < half)
+        return x;
+    return x - floor(x / 33554432.0 + 0.5) * 33554432.0;
+}
+
+float samplePerlin263(const PerlinNoise *noise, double x, double y, double z)
+{
+    const uint8_t *d = noise->d;
+    x = wrap263(x) + noise->a;
+    y = wrap263(y) + noise->b;
+    z = wrap263(z) + noise->c;
+    int ix = (int) floor(x);
+    int iy = (int) floor(y);
+    int iz = (int) floor(z);
+    float rx = (float) (x - ix);
+    float ry = (float) (y - iy);
+    float rz = (float) (z - iz);
+
+    int x0 = d[ix & 0xff];
+    int x1 = d[(ix + 1) & 0xff];
+    int xy00 = d[(x0 + iy) & 0xff];
+    int xy01 = d[(x0 + iy + 1) & 0xff];
+    int xy10 = d[(x1 + iy) & 0xff];
+    int xy11 = d[(x1 + iy + 1) & 0xff];
+
+    float d000 = gradDot263(d[(xy00 + iz) & 0xff], rx,      ry,      rz);
+    float d100 = gradDot263(d[(xy10 + iz) & 0xff], rx-1.0F, ry,      rz);
+    float d010 = gradDot263(d[(xy01 + iz) & 0xff], rx,      ry-1.0F, rz);
+    float d110 = gradDot263(d[(xy11 + iz) & 0xff], rx-1.0F, ry-1.0F, rz);
+    float d001 = gradDot263(d[(xy00 + iz + 1) & 0xff], rx,      ry,      rz-1.0F);
+    float d101 = gradDot263(d[(xy10 + iz + 1) & 0xff], rx-1.0F, ry,      rz-1.0F);
+    float d011 = gradDot263(d[(xy01 + iz + 1) & 0xff], rx,      ry-1.0F, rz-1.0F);
+    float d111 = gradDot263(d[(xy11 + iz + 1) & 0xff], rx-1.0F, ry-1.0F, rz-1.0F);
+
+    float ax = smoothstep263(rx);
+    float ay = smoothstep263(ry);
+    float az = smoothstep263(rz);
+
+    // Mth.lerp3()
+    float v00 = lerp263(ay, lerp263(ax, d000, d100), lerp263(ax, d010, d110));
+    float v01 = lerp263(ay, lerp263(ax, d001, d101), lerp263(ax, d011, d111));
+    return lerp263(az, v00, v01);
+}
+
+static inline float sampleLayer263(const PerlinNoise *p,
+        double x, double y, double z)
+{
+    double f = p->lacunarity;
+    return (float) p->amplitude * samplePerlin263(p, x * f, y * f, z * f);
+}
+
+/* NoiseStack.get() for NormalNoise.create(): the two octave sets are
+ * interleaved by octave.
+ */
+float sampleDoublePerlin263(const DoublePerlinNoise *noise,
+        double x, double y, double z)
+{
+    float v = 0;
+    int i, n = noise->octA.octcnt;
+    if (noise->octB.octcnt > n)
+        n = noise->octB.octcnt;
+    for (i = 0; i < n; i++)
+    {
+        if (i < noise->octA.octcnt)
+            v += sampleLayer263(noise->octA.octaves + i, x, y, z);
+        if (i < noise->octB.octcnt)
+            v += sampleLayer263(noise->octB.octaves + i, x, y, z);
+    }
+    return v;
+}
+
+/* NoiseStack.get() for NormalNoise.createForLegacyNetherBiome(): the second
+ * octave set follows the first.
+ */
+float sampleDoublePerlinNether263(const DoublePerlinNoise *noise,
+        double x, double y, double z)
+{
+    float v = 0;
+    int i;
+    for (i = 0; i < noise->octA.octcnt; i++)
+        v += sampleLayer263(noise->octA.octaves + i, x, y, z);
+    for (i = 0; i < noise->octB.octcnt; i++)
+        v += sampleLayer263(noise->octB.octaves + i, x, y, z);
+    return v;
+}
