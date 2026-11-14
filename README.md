@@ -1,5 +1,23 @@
 # cubiomes
 
+## About this fork
+
+This fork adds Minecraft Java Edition 1.21.5 through 26.3: the new biome
+trees, sulfur caves, dappled forest, abandoned camps and the single precision
+noise of 26.3, verified against the game. `docs/DumpTree.java` and
+`docs/nptree_encode.py` generate the biome tree tables from the game itself.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/0rwx/AI-W-dark.svg">
+  <img alt="0rwx W: AI collaboration" src="docs/0rwx/AI-W-light.svg" width="100">
+</picture>
+
+The changes in this fork are labelled **W: AI collaboration** under the
+[0rwx](https://0rwx.com/) framework, meaning AI had read-write access to the
+work. The label covers this fork's changes only, not the original work by
+Cubitect. (0rwx logos by Namtao Productions, CC0.)
+
+
 Cubiomes is a standalone library, written in C, that mimics the biome and feature generation of Minecraft Java Edition.
 It is intended as a powerful tool to devise very fast, custom seed-finding applications and large-scale map viewers with minimal memory usage.
 
