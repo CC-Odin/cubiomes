@@ -1,8 +1,23 @@
 # cubiomes
 
-## About this fork
+## CC-Odin fork
 
-This fork adds Minecraft Java Edition 1.21.5 through 26.3: the new biome
+This fork of Cubitect/cubiomes carries 26.3 support for the Moana seed finder. It is based on
+[nsyout/cubiomes](https://github.com/nsyout/cubiomes) (described below), chosen on 2026-11-16 after a
+check against the real 26.3 server code. The checks covered 5 seeds × 512 × 512 cells at y 64.
+- Climate values: identical to the game in every cell.
+- Biome tree: matches the game's cache-free lookup in every cell.
+
+The fork [xpple/cubiomes](https://github.com/xpple/cubiomes) was also checked. Its climate values were
+one step off in about 0.8% of cells, and its tree disagreed in 39 to 121 cells per seed.
+
+One limit applies to any cubiomes build. In a few cells the game itself gives different biomes depending
+on the order it looks them up, because of the R-tree's warm-start cache. In these checks that was about
+0.05% of cells.
+
+## About nsyout's fork
+
+nsyout's fork adds Minecraft Java Edition 1.21.5 through 26.3: the new biome
 trees, sulfur caves, dappled forest, abandoned camps and the single precision
 noise of 26.3, verified against the game. `docs/DumpTree.java` and
 `docs/nptree_encode.py` generate the biome tree tables from the game itself.
